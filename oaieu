@@ -1,0 +1,866 @@
+#!/usr/bin/python3
+# vim:se tw=0 sts=4 ts=4 et ai:
+"""
+Copyright © 2020 Osamu Aoki
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License as
+published by the Free Software Foundation; either version 2 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
+USA
+"""
+# For main
+import argparse
+
+# For sub-commands
+import os
+import os.path
+import sys
+import re
+import hashlib
+import collections
+from operator import itemgetter
+import time
+import datetime
+import binascii
+
+# For accessing JPEG image data
+from PIL import Image
+
+# For accessing EXIF image meta data header
+# Use GExiv2 from gir1.2-gexiv2-* package via python3-gi
+#     https://git.gnome.org/browse/gexiv2/tree/GExiv2.py
+import gi
+
+gi.require_version("GExiv2", "0.10")
+from gi.repository import GExiv2
+
+# For debug using "pmsg"
+# from pprint import pprint
+
+MIN_PYTHON = (3, 3)
+if sys.version_info < MIN_PYTHON:
+    sys.exit("Python %s.%s or later is required.\n" % MIN_PYTHON)
+#######################################################################
+# Global variables
+#######################################################################
+verbose = 0  # -q:             Quiet
+# verbose = 1  #      W: ...   Warnings
+# verbose = 2: # -v   I: ...   Infos
+# verbose = 3: # -vv  D: ...   Debug details of action results
+
+#######################################################################
+# utility functions
+#######################################################################
+# print when verbose >= verbose_level
+def msg(verbose_level, message, end="\n", flush=True, file=sys.stderr):
+    if verbose >= verbose_level:
+        print(message, end=end, flush=flush, file=file)
+
+
+def error_exit(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
+# For debug
+# def pmsg(name, message):
+#    if verbose >= 4:
+#        print(">>> {}: ".format(name))
+#        pprint(message)
+
+
+# Read first <length> bytes from <path> and return byte stream in HEX format
+def firstbytes(path, length=16):
+    with open(path, "rb") as f:
+        header = binascii.hexlify(f.read()[:length]).decode("UTF-8")
+    return header
+
+
+def removefile(filepath):
+    try:
+        os.remove(filepath)
+    except OSError:
+        print("E: OSError os.remove({})".format(filepath), file=sys.stderr)
+
+
+def removedir(dirpath):
+    try:
+        os.rmdir(dirpath)
+    except OSError:
+        print("E: OSError os.rmdir({})".format(filepath), file=sys.stderr)
+
+
+def exifdt(exifdata, tag):
+    if tag in exifdata:
+        return exifdata[tag]
+    else:
+        return "___________________"  # matched length to DateTime*[19]
+
+
+#######################################################################
+# sub-commands
+#######################################################################
+def help(args):
+    args.parser.print_help()
+    return
+
+
+# find under the base path and print paths
+def find(args):
+    base_path = os.path.realpath(args.path)
+    jpeg_ext = tuple(args.jpeg_ext.split(","))
+    if args.filetype not in ["jpeg", "jpeg-date", "jpeg-nodate", "others"]:
+        msg(1, "W: filetype = {} --> jpeg".format(args.filetype))
+        args.filetype = "jpeg"
+    msg(3, "D: base_path = {}".format(base_path))
+    for dirpath, dirnames, filenames in os.walk(base_path):
+        # don't walk out of filesystem
+        dirnames[:] = [d for d in dirnames if not os.path.ismount(d)]
+        for filename in filenames:
+            filepath = os.path.join(dirpath, filename)
+            filetype = "others" # default
+            msg(3, "D: file = {}".format(filepath))
+            if filepath.lower().endswith(jpeg_ext):
+                if os.path.islink(filepath):
+                    msg(1, "W: symlink: {}".format(filepath))
+                elif not os.access(filepath, os.R_OK):
+                    msg(1, "W: unreadable: {}".format(filepath))
+                elif os.path.getsize(filepath) == 0:
+                    msg(1, "W: zero length: {}".format(filepath))
+                elif firstbytes(filepath, 3) == "ffd8ff":  # JPEG
+                    try:
+                        exifdata = GExiv2.Metadata(filepath)
+                    except:
+                        msg(1, "W: broken EXIF: {}".format(filepath))
+                    else:
+                        if ("Exif.Image.DateTimeOriginal" in exifdata
+                        and "Exif.Image.DateTimeDigitized" in exifdata
+                        and "Exif.Image.DateTime" in exifdata):
+                            if exifdata["Exif.Image.DateTimeOriginal"] == exifdata["Exif.Image.DateTimeDigitized"] == exifdata["Exif.Image.DateTime"]:
+                                msg(2, "I: EXIF with matched DateTime*: {}".format(filepath))
+                                filetype = "jpeg-matched-datetime"
+                            else:
+                                msg(2, "I: EXIF with skewed DateTime*: {}".format(filepath))
+                                filetype = "jpeg-skewed-datetime"
+                        else:
+                            msg(2, "I: EXIF without DateTime: {}".format(filepath))
+                            filetype = "jpegmissing-datetime"
+                else:
+                    msg(1, "W: no JPEG file header:  {}".format(filepath))
+            else:
+                msg(2, "I: no JPEG extension:  {}".format(filepath))
+            # allow short spec
+            if args.filetype == filetype[:len(args.filetype)]:
+                msg(3, "D: filetype={}\t{}".format(filetype, filepath))
+                print(filepath)
+    return
+
+
+def id(args):
+    hvcount = collections.Counter()
+    if args.preload != "" and os.path.isfile(args.preload):
+        with open(args.preload, "r") as fp:
+            msg(3, "D: preload = {}".format(args.preload))
+            for line in fp.read().splitlines():
+                (hv, hvc, dtstr, filepath, action) = line.split("\t")
+                # ignore "***delete***" line
+                if action == "":
+                    hvcount.update([hv])
+    else:
+        msg(3, "D: No preload")
+    for filepath in sys.stdin.read().splitlines():
+        msg(3, "D: filepath = {}".format(filepath))
+        try:
+            hv = hashlib.sha256(Image.open(filepath, mode="r").tobytes()).hexdigest()
+            msg(3, "D: hv = {} @ {}".format(hv, filepath))
+        except IOError:
+            #     73c77250f7a05177d24571657746a9ad7531f1fc4a6d460859072a904cd3ab30 sha256
+            hv = "___PIL.Image_IOError____________________________________________"
+            msg(1, "W: hv = {} @ {}".format(hv, filepath))
+        hvcount.update([hv])
+        # limit reported count "hvc" to saturate at 99
+        hvc = 99 if hvcount[hv] > 99 else hvcount[hv]
+        msg(3, "D: count['{}'] = {:02}".format(hv, hvc))
+        try:
+            exifdata = GExiv2.Metadata(filepath)
+        except:
+            msg(1, "W: can not find EXIF metadata: {}".format(filepath))
+            dtstr = "___NOT_EXIF_DATA___"
+        else:
+            dtstr = exifdt(exifdata, "Exif.Photo.DateTimeOriginal")
+            msg(3, "D: Exif.Photo.DateTimeOriginal = {}".format(dtstr))
+        if hvc > args.number and args.uniq:
+            removefile(path)
+            hvcount[hv] += -1
+            msg(3, "D: count={:02} delete: {}".format(hvc, filepath))
+            action = "***delete***"
+        else:
+            action = ""
+        print("{}\t{:02}\t{}\t{}\t{}".format(hv, hvc, dtstr, filepath, action))
+    return
+
+
+def rm(args):
+    for filepath in sys.stdin.read().splitlines():
+        removefile(filepath)
+        msg(2, "I: rm {}".format(filepath))
+    # If args.basepath="", no rmdir
+    base_dir = os.path.realpath(args.basepath)
+    for dirpath, dirnames, filenames in os.walk(base_dir, topdown=False):
+        if len(filenames) == 0 and len(dirnames) == 0:
+            removedir(dirpath)
+            msg(2, "I: rmdir {}".format(dirpath))
+        else:
+            msg(3, "D: keep dir {}".format(dirpath))
+    return
+
+
+def r_exif(args):
+    for filepath in sys.stdin.read().splitlines():
+        msg(3, "D: path = {}".format(filepath))
+        try:
+            exifdata = GExiv2.Metadata(filepath)
+        except:
+            msg(1, "W: not EXIF: {}".format(filepath))
+            continue
+        msg(2, "I: EXIF    : {}".format(filepath))
+        if args.action == "date" or args.action == "1":
+            print(
+                "{}\t{}".format(
+                    exifdt(exifdata, "Exif.Photo.DateTimeOriginal"), filepath
+                )
+            )
+        elif args.action == "date3" or args.action == "3":
+            print(
+                "{}\t{}\t{}\t{}".format(
+                    exifdt(exifdata, "Exif.Image.DateTime"),
+                    exifdt(exifdata, "Exif.Photo.DateTimeDigitized"),
+                    exifdt(exifdata, "Exif.Photo.DateTimeOriginal"),
+                    filepath,
+                )
+            )
+        elif args.action == "update_timestamp" or args.action == "u":
+            # set filesystem time from exif
+            if "Exif.Photo.DateTimeOriginal" in exifdata:
+                exif_dt = exifdata["Exif.Photo.DateTimeOriginal"]
+            elif "Exif.Photo.DateTimeDigitized" in exifdata:
+                exif_dt = exifdata["Exif.Photo.DateTimeDigitized"]
+            elif "Exif.Image.DateTime" in exifdata:
+                exif_dt = exifdata["Exif.Image.DateTime"]
+            else:
+                msg(1, "W: skip update fs time: {}".format(filepath))
+                continue  # skip update_timestamp
+            #
+            # ltime: Python struct_time assuming exif_dt to be local time zone
+            #        ltime.tm_zone=None
+            #
+            msg(2, "I: update mtime: {} EXIF  {}".format(exif_dt, filepath))
+            ltime = time.strptime(exif_dt, "%Y:%m:%d %H:%M:%S")
+            # utime: POSIX time matching exif_dt
+            utime = time.mktime(ltime)
+            os.utime(filepath, (utime, utime))  # update (atime, mtime)
+            utime = os.stat(filepath).st_mtime
+            ltime = time.localtime(utime)
+            exif_dt = time.strftime("%Y:%m:%d %H:%M:%S", ltime)
+            msg(3, "D: verify mtime: {} OS_FS {}".format(exif_dt, filepath))
+        elif args.action == "basic" or args.action == "b":
+            print("{}".format(filepath))
+            for tag in exifdata:
+                if tag in [
+                    "Exif.Image.Make",
+                    "Exif.Image.Model",
+                    "Exif.Image.DateTime",
+                    "Exif.Photo.DateTimeDigitized",
+                    "Exif.Photo.DateTimeOriginal",
+                ]:
+                    print("\t{:34}: {}".format(tag, exifdata[tag]))
+        elif args.action == "image" or args.action == "i":
+            print("{}".format(filepath))
+            for tag in exifdata:
+                if tag[:11] == "Exif.Image.":
+                    print("\t{:34}: {}".format(tag, exifdata[tag]))
+        elif args.action == "generic" or args.action == "g":
+            print("{}".format(filepath))
+            for tag in exifdata:
+                if (
+                    tag[:11] == "Exif.Image." or tag[:11] == "Exif.Photo."
+                ) and tag != "Exif.Photo.MakerNote":
+                    print("\t{:34}: {}".format(tag, exifdata[tag]))
+        else:  # if args.action == "all"
+            print("{}".format(filepath))
+            for tag in exifdata:
+                print("\t{:34}: {}".format(tag, exifdata[tag]))
+    return
+
+
+re_exif_datetime_long = re.compile(r"^(?:19|20)\d\d:\d\d:\d\d \d\d:\d\d:\d\d$")
+re_exif_datetime_short = re.compile(r"^(?:19|20)\d\d:\d\d:\d\d$")
+re_exif_datetime_number = re.compile(r"^(?:19|20)\d\d\d\d\d\d")
+re_exif_datetime_delta = re.compile(r"^[-+]?\d?\d(?:[:]?\d\d(?:[:]?\d\d)?)?")
+
+
+def w_exif(args):
+    # sanitize basedate "1980:01:01 00:00:00"
+    if len(args.basedate) == 19 and re_exif_datetime_long.match(args.basedate):
+        basedate = args.basedate
+    elif len(args.basedate) == 10 and re_exif_datetime_short.match(args.basedate):
+        basedate = args.basedate + " 12:00:00"
+    elif len(args.basedate) == 8 and re_exif_datetime_number.match(args.basedate):
+        basedate = (
+            args.basedate[:4]
+            + ":"
+            + args.basedate[4:6]
+            + ":"
+            + args.basedate[6:8]
+            + " 12:00:00"
+        )
+    else:
+        basedate = ""
+    for i, filepath in enumerate(sys.stdin.readlines()):
+        msg(3, "D: path[{}] = {}".format(i, filepath))
+        try:
+            exifdata = GExiv2.Metadata(filepath)
+        except:
+            msg(1, "W: not exif: {}".format(filepath))
+            continue
+        msg(2, "I: EXIF    : {}".format(filepath))
+        if args.keep:
+            try:
+                os.rename(filepath, filepath + ".keep")
+            except:
+                error_exit(
+                    "E: fail to rename: {} --> {}".format(filepath, filepath + ".keep")
+                )
+        if args.delta != "" and "Exif.Photo.DateTimeOriginal" in exifdata:
+            # adjust based on "Exif.Photo.DateTimeOriginal"
+            if not re_exif_datetime_delta.match(args.delta):
+                error_exit("E: bad DELTA string (regex): '{}'".format(args.delta))
+            if args.delta[0] == "-":
+                sign = -1
+                delta = args.delta[1:]
+            elif args.delta[0] == "+":
+                sign = 1
+                delta = args.delta[1:]
+            else:
+                sign = 1
+                delta = args.delta
+            if len(delta) == 1:
+                delta = "0" + delta + ":00:00"
+            elif len(delta) == 2:
+                delta = delta + ":00:00"
+            elif len(delta) == 4:
+                delta = delta[:2] + ":" + delta[2:] + ":00"
+            elif len(delta) == 5 and delta[2] == ":":
+                delta = delta + ":00"
+            elif len(delta) == 6:
+                delta = delta[:2] + ":" + delta[2:4] + ":" + delta[4:6]
+            elif len(delta) == 8 and delta[2] == ":" and delta[5] == ":":
+                delta = delta
+            else:
+                error_exit("E: bad DELTA string (last): '{}'".format(args.delta))
+            # delta is easier with datetime
+            delta_time = sign * datetime.datetime.strptime(delta)
+            exif_time = (exifdata.get_date_time() + delta_time).strftime(
+                "%Y:%m:%d %H:%M:%S"
+            )
+            if args.force or (
+                "Exif.Image.DateTime" in exifdata
+                and "Exif.Image.DateTime.Original" in exifdata
+                and exifdata["Exif.Image.DateTime"]
+                == exifdata["Exif.Image.DateTimeOriginal"]
+            ):
+                exifdata["Exif.Image.DateTime"] = exif_time
+                msg(
+                    3,
+                    "D: {} -> {}\t{}".format(
+                        exifdata["Exif.Photo.DateTime"], exif_time, filepath
+                    ),
+                )
+            else:
+                msg(
+                    1,
+                    "W: {} != {} (original)\t{} *** skip changing Exif.Photo.DateTime ***".format(
+                        exifdata["Exif.Photo.DateTime"], exif_time, filepath
+                    ),
+                )
+            if args.force or (
+                "Exif.Image.DateTimeDigitized" in exifdata
+                and "Exif.Image.DateTime.Original" in exifdata
+                and exifdata["Exif.Image.DateTimeDigitized"]
+                == exifdata["Exif.Image.DateTimeOriginal"]
+            ):
+                exifdata["Exif.Photo.DateTimeDigitized"] = exif_time
+                msg(
+                    3,
+                    "D: {} -> {}\t{}".format(
+                        exifdata["Exif.Photo.DateTimeDigitized"], exif_time, filepath
+                    ),
+                )
+            else:
+                msg(
+                    1,
+                    "W: {} != {} (original)\t{} *** skip changing Exif.Photo.DateTimeDigitized ***".format(
+                        exifdata["Exif.Photo.DateTimeDigitized"], exif_time, filepath
+                    ),
+                )
+            exifdata["Exif.Photo.DateTimeOriginal"] = exif_time
+            msg(
+                3,
+                "D: {} -> {}\t{}".format(
+                    exifdata["Exif.Photo.DateTimeOriginal"], exif_time, filepath
+                ),
+            )
+        elif basedate != "" and (
+            args.force
+            or (
+                "Exif.Photo.DateTimeOriginal" not in exifdata
+                and "Exif.Photo.DateTimeDigitized" not in exifdata
+                and "Exif.Image.DateTime" not in exifdata
+            )
+        ):
+            # set EXIF DateTime* data
+            exif_dt = basedate
+            #
+            # ltime: Python struct_time assuming exif_dt to be local time zone
+            #        ltime.tm_zone=None
+            #
+            # Here, time.strptime from time module is used since datetime
+            # doesn't have easy conversion to POSIX time from string except
+            # for ISO format
+            #
+            ltime = time.strptime(exif_dt, "%Y:%m:%d %H:%M:%S")
+            # utime: POSIX time matching exif_dt with tiny offset.
+            #        offset is increments of 2s for DOS FAT
+            utime = time.mktime(ltime) + 2 * i
+            ltime = time.localtime(utime)
+            exif_dt = time.strftime("%Y:%m:%d %H:%M:%S", ltime)
+            exifdata["Exif.Photo.DateTimeOriginal"] = exif_dt
+            exifdata["Exif.Photo.DateTimeDigitized"] = exif_dt
+            exifdata["Exif.Image.DateTime"] = exif_dt
+            msg(3, "D: update mtime: {} EXIF  {}".format(exif_dt, filepath))
+            os.utime(filepath, (utime, utime))  # update (atime, mtime)
+            utime = os.stat(filepath).st_mtime
+            ltime = time.localtime(utime)
+            exif_dt = time.strftime("%Y:%m:%d %H:%M:%S", ltime)
+            msg(3, "D: verify mtime: {} OS_FS {}".format(exif_dt, filepath))
+        if args.make != "" and (args.force or "Exif.Image.Make" not in exifdata):
+            exifdata["Exif.Image.Make"] = args.make
+        if args.model != "" and (args.force or "Exif.Image.Model" not in exifdata):
+            exifdata["Exif.Image.Model"] = args.model
+        if not args.simulate:
+            try:
+                exifdata.save_file()
+            except:
+                error_exit("E: Not writable with new EXIF data: {}".format(filepath))
+    return
+
+
+def org(args):
+    basepath = os.path.realpath(args.basepath)
+    os.makedirs(basepath, exist_ok=True)
+    for i, filepath in ennumerate(sys.stdin.readlines()):
+        msg(3, "D: path[{}] = {}".format(i, filepath))
+        try:
+            exifdata = GExiv2.Metadata(filepath)
+        except:
+            msg(1, "W: not exif: {}".format(filepath))
+            continue
+        # Exif.Photo.DateTimeOriginal
+        # pick timestamp in exif as datetime.datetime(*,*,*,*,*,*)
+        if "Exif.Photo.DateTimeOriginal" in exifdata:
+            exif_dt = exifdata["Exif.Photo.DateTimeOriginal"]
+            ltime = time.strptime(exif_dt, "%Y:%m:%d %H:%M:%S")
+        else:
+            # use FS timestamp
+            ltime = time.localtime(os.path.getmtime(filepath))
+            exif_dt = time.strftime("%Y:%m:%d %H:%M:%S", ltime)
+        msg(2, "I: org: {} {}".format(exif_dt, filepath))
+        # utime: POSIX time matching exif_dt
+        utime = time.mktime(ltime)
+        if "Exif.Image.Model" in exifdata:
+            model = exifdata["Exif.Image.Model"]
+        else:
+            model = "NOMODEL"
+        hmodel = hashlib.sha256(model.encode("utf-8")).hexdigest()
+        hsize = hashlib.sha256(
+            str(os.stat(filepath).st_size).encode("utf-8")
+        ).hexdigest()
+        # https://docs.python.org/ja/3/library/time.html?highlight=strftime#time.strftime
+        # To name after date/time pattern "I%Y%m%d%H%M%S" (year:4 month:2 day:2)
+        # To add model hash (2 chars)     "I%Y%m%d%H%M%S{model:.2}"
+        # To add size hash (4 chars)      "I%Y%m%d%H%M%S{model:.2}{size:.4}"
+        # To name after date/time pattern "I%y%U%w%H%M%S" (year:2 week:2 day_week:1)
+        template = args.template.format(model=hmodel, size=hsize)
+        filename = time.strftime(template, ltime)
+        destdirlist = [basepath]
+        if args.model == "before":
+            destdirlist.append(model.replace(" ", ""))
+        if args.split == "all":
+            pass
+        elif args.split == "year":
+            destdirlist.append(time.strftime("%Y", ltime))
+        elif args.split == "month":
+            destdirlist.append(time.strftime("%Y", ltime))
+            destdirlist.append(time.strftime("%m", ltime))
+        elif args.split == "week":
+            destdirlist.append(time.strftime("%Y", ltime))
+            destdirlist.append(time.strftime("%U", ltime))
+        elif args.split == "dayweek":
+            destdirlist.append(time.strftime("%Y", ltime))
+            destdirlist.append(time.strftime("%U", ltime))
+            destdirlist.append(time.strftime("%w", ltime))
+        else:  # daymonth or any
+            destdirlist.append(time.strftime("%Y", ltime))
+            destdirlist.append(time.strftime("%m", ltime))
+            destdirlist.append(time.strftime("%d", ltime))
+        if args.model == "after":
+            destdirlist.append(model.replace(" ", ""))
+        destdir = os.sep.join(destdirlist)
+        os.makedirs(destdir, exist_ok=True)
+        filename = filename + ".JPG"
+        destpath = os.sep.join([destdir, filename])
+        if os.path.isfile(destpath):
+            error_exit(
+                "Destination exists as file: {} --> {}".format(filepath, destpath)
+            )
+        if os.path.isdir(destpath):
+            error_exit(
+                "Destination exists as dir: {} --> {}".format(filepath, destpath)
+            )
+        if os.path.islink(destpath):
+            error_exit(
+                "Destination exists as link: {} --> {}".format(filepath, destpath)
+            )
+        if filepath != destpath:
+            msg(4, "LINK FILE: {} --> {}".format(filepath, destpath))
+            try:
+                os.link(f, destpath)
+            except:
+                msg(1, "W: No link created: {} --> {}".format(filepath, destpath))
+                continue
+            if args.rm:
+                for f in files:
+                    removefile(f)
+                    msg(4, "REMOVE FILE: {}".format(f))
+        else:
+            msg(1, "W: Skip link to self: {} --> {}".format(filepath, destpath))
+    return
+
+
+#######################################################################
+# main: parse commandline parser
+#######################################################################
+def main():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""\
+Osamu Aoki's Image and Exif Utility ({progname}) (version: {version})
+
+A collection of python scripts to organize digital camera image files in the
+JPEG format.  This program uses the exiv2 library via GObject introspection to
+access the EXIF image meta data and PIL to access the image data, and sha256 to
+generate the image identity hash string.
+
+The common options across subcommands are specified right after the parent
+command.  STDIN and STDOUT are meant to be re-directed to files.  The messaging
+to the user uses only STDERR.
+""".format(
+            version = "0.1", progname = os.path.basename(sys.argv[0])
+        ),
+        epilog="""
+See https://github.com/osamuaoki/{}
+Copyright (C) 2020 Osamu Aoki <osamu@debian.org>
+License: GPL 2.0+
+""".format(
+            os.path.basename(sys.argv[0])
+        ),
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=1,
+        help="verbose STDERR output: -v, -vv, -vvv",
+    )
+    parser.add_argument(
+        "-q", "--quiet", action="store_true", default=False, help="no STDERR output"
+    )
+    parser.set_defaults(func=help, parser=parser)
+    #######################################################################
+    # sub-command
+    #######################################################################
+    subparsers = parser.add_subparsers(
+            title="subcommands", help="action (use '-h' for more help)"
+    )
+#        description="""\
+#help for sub-commands are available by following each one of them with
+#--help."""
+    #######################################################################
+    # sub-command: find
+    #######################################################################
+    parser_find = subparsers.add_parser(
+        "find",
+        help="find JPEG files",
+        description="""\
+find JPEG files at and under the specified basepath and print their path list
+to STDOUT.""",
+    )
+    parser_find.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="find files found at and under this path (default='.')",
+    )
+    parser_find.add_argument(
+        "-f",
+        "--filetype",
+        default="jpeg",
+        action="store",
+        help="""\
+FILETYPE to match: "jpeg" (default), "jpeg-matched-datetime",
+"jpeg-skewed-datetime", "jpegmissing-datetime", or "others".  "jpeg-" can be
+used to match all 2 "jpeg-*" with all 3 "datetime" data which may produce
+better list. Files listed by "jpegmissing-datetime" (or "jpegm") require manual
+attention in the dollowinh processing.  Specification can be shortened.
+""",
+    )
+    parser_find.add_argument(
+        "-j",
+        "--jpeg_ext",
+        default=".jpg,.jpeg",
+        help="""\
+file extensions to match for JPEG files (comma separated, case insensitive):
+".jpg,.jpeg" (default)""",
+    )
+    parser_find.set_defaults(func=find)
+    #######################################################################
+    # sub-command: id
+    #######################################################################
+    parser_id = subparsers.add_parser(
+        "id",
+        help="generate image identifier list and optionally remove diplicates",
+        description="""\
+read the JPEG file path list from the STDIN, calculate the image identifier
+(ID, hash value for the JPEG image data), count up for each ID, print result
+list in TSV to STDOUT, and optionally remove excess duplicates.  STDOUT result
+can be saved as PRELOAD and used to preload the counter in the following
+processing.""",
+    )
+    parser_id.add_argument(
+        "-p",
+        "--preload",
+        default="",
+        action="store",
+        help="""\
+preload the previous "oaieu id" STDOUT result saved as PRELOAD""",
+    )
+    parser_id.add_argument(
+        "-u",
+        "--uniq",
+        default=False,
+        action="store_true",
+        help="remove excess duplicates",
+    )
+    parser_id.add_argument(
+        "-n",
+        "--number",
+        default=1,
+        type=int,
+        help="""\
+number of duplicates allowed: 1 (default)""",
+    )
+    parser_id.set_defaults(func=id)
+    #######################################################################
+    # sub-command: rm
+    #######################################################################
+    parser_rm = subparsers.add_parser(
+        "rm",
+        help="remove files",
+        description="""\
+read the file path list from the STDIN, remove them, and prune empty
+directories at and under the specified basepath.  This is meant to be used for
+the file path list generated by 'oaieu find -f others'""",
+    )
+    parser_rm.add_argument(
+        "basepath",
+        nargs="?",
+        default="",
+        help="""\
+prune directories at and under the specified basepath (default='' disabled)""",
+    )
+    parser_rm.set_defaults(func=rm)
+    #######################################################################
+    # sub-command: r_exif
+    #######################################################################
+    parser_r_exif = subparsers.add_parser(
+        "r_exif",
+        aliases=["re"],
+        help="read EXIF data and act on it (no write back)",
+        description="""\
+read the JPEG file path list from the STDIN, access EXIF data, and perform the
+specified action on each file without writing back to it.  The specified action
+may be reporting EXIF data values for a certain set of EXIF tags to STDOUT, or
+updating the file system timestamp of each file using the EXIF DateTimeOriginal
+or other bast available DateTime* value""",
+    )
+    parser_r_exif.add_argument(
+        "action",
+        default="date",
+        nargs="?",
+        help="""\
+action to take: "date" (default, alias "1"), "date3" (alias "3"),
+"update_timestamp" (alias "u"), "basic" (alias "b"), "image" (alias "i"),
+"generic" (alias "g"), "all" (fallback).""",
+    )
+    parser_r_exif.set_defaults(func=r_exif)
+    #######################################################################
+    # sub-command: w_exif
+    #######################################################################
+    parser_w_exif = subparsers.add_parser(
+        "w_exif",
+        aliases=["we"],
+        help="read EXIF data and write back to it",
+        description="""\
+read the JPEG file path list from the STDIN, access EXIF data, and write back
+EXIF data as specified.  For '-b BASEDATE', new DateTimeOriginal,
+DateTimeDigitized, and DateTime tags are added with specified values while
+incremented evry 2 seconds matching the resolution of the VFAT file system.
+For '-d DELTA', existing DateTimeOriginal values are adjusted with the
+specified delta time; and DateTimeDigitized, and DateTime values are updated if
+these were in-sync with DateTimeOriginal.  Using '-f -d 0' updates
+DateTimeDigitized, and DateTime values to match DateTimeOriginal value.  You
+must quote the argument option value containing '-' and ':'.""",
+    )
+    parser_w_exif.add_argument(
+        "-f",
+        "--force",
+        default=False,
+        action="store_true",
+        help="force to add data even for preexisting cases and for out-of-sync cases",
+    )
+    parser_w_exif.add_argument(
+        "-k",
+        "--keep",
+        default=False,
+        action="store_true",
+        help="keep original file by adding .keep to it",
+    )
+    parser_w_exif.add_argument(
+        "-s",
+        "--simulate",
+        default=False,
+        action="store_true",
+        help="simulate without writing back",
+    )
+    parser_w_exif_time = parser_w_exif.add_mutually_exclusive_group(required=False)
+    parser_w_exif_time.add_argument(
+        "-b",
+        "--basedate",
+        default="",
+        action="store",
+        help="specify the base date as: 'YYYY:mm:dd HH:MM:SS' or 'YYYY:mm:dd' or 'YYYYmmdd'",
+    )
+    parser_w_exif_time.add_argument(
+        "-d",
+        "--delta",
+        default="",
+        action="store",
+        help="""\
+specify the delta time as '[+|-|]HH:MM:SS' or '[+|-|]HH:MM' or '[+|-|]HHMMSS'
+or '[+|-|]HHMM' or '[+|-|]HH' or '[+|-|]H' """,
+    )
+    parser_w_exif.add_argument(
+        "-a", "--make", default="", action="store", help="specify the make"
+    )
+    parser_w_exif.add_argument(
+        "-o", "--model", default="", action="store", help="specify the model"
+    )
+    parser_w_exif.set_defaults(func=w_exif)
+    #######################################################################
+    # sub-command: org
+    #######################################################################
+    parser_org = subparsers.add_parser(
+        "org",
+        help="organize JPEG files",
+        description="""\
+read the JPEG file path list from the STDIN, access EXIF data, and organize
+them by creating hardlinks under basepath (default "./NEW").""",
+    )
+    parser_org.add_argument(
+        "basepath", nargs="?", default="./NEW", help="creating hardlinks under basepath"
+    )
+    parser_org.add_argument(
+        "-r",
+        "--rm",
+        default=False,
+        action="store_true",
+        help="remove original link to the file",
+    )
+    parser_org.add_argument(
+        "-m",
+        "--model",
+        default="",
+        action="store",
+        help="""\
+organize directory by the camera model before or after the time based split:
+"no_split" (default), "before", "after" """,
+    )
+    parser_org.add_argument(
+        "-s",
+        "--split",
+        default="default",
+        action="store",
+        help="""\
+organize directory by the time split with resolution: "default" (daymonth),
+"dayweek", "week", "month", "year", "all" """,
+    )
+    # https://docs.python.org/ja/3/library/time.html?highlight=strftime#time.strftime
+    # To name after date/time pattern "I%Y%m%d%H%M%S" (year:4 month:2 day:2)
+    # To add model hash (2 chars)     "I%Y%m%d%H%M%S{model:.2}"
+    # To add size hash (4 chars)      "I%Y%m%d%H%M%S{model:.2}{size:.4}"
+    # To name after date/time pattern "I%y%U%w%H%M%S" (year:2 week:2 day_week:1)
+    parser_org.add_argument(
+        "-t",
+        "--template",
+        default="I%y%m%d_%H%M%S_{model:.2}_{size:.4}",
+        action="store",
+        help="""\
+filename template: "I%%y%%m%%d_%%H%%M%%S_{model:.2}_{size:.4}" (default).
+{model} and {size} are substituted with respective hash values.
+"I%%H%%M%%S{size:.1}" can make 8 char filename.
+""",
+    )
+    parser_org.set_defaults(func=org)
+    #######################################################################
+    # generate argument parser instance
+    #######################################################################
+    args = parser.parse_args()
+    #######################################################################
+    # Update variables with sanitization
+    #######################################################################
+    if args.quiet:
+        args.verbose = 0
+    global verbose
+    verbose = args.verbose
+    #######################################################################
+    # call sub-command
+    #######################################################################
+    args.func(args)
+    return
+
+
+#######################################################################
+# Test code
+#######################################################################
+if __name__ == "__main__":
+    main()
