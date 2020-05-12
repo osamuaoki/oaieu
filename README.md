@@ -40,7 +40,7 @@ License: GPL 2.0+
 usage: oaieu find [-h] [-f FILETYPE] [-j JPEG_EXT] [path]
 
 find JPEG files at and under the specified basepath and print their path list
-to STDOUT.
+to STDOUT.  The result is sorted in ASCII order.
 
 positional arguments:
   path                  find files found at and under this path (default='.')
@@ -68,7 +68,8 @@ read the JPEG file path list from the STDIN, calculate the image identifier
 (ID, hash value for the JPEG image data), count up for each ID, print result
 list in TSV to STDOUT, and optionally remove excess duplicates. STDOUT result
 can be saved as PRELOAD and used to preload the counter in the following
-processing.
+processing. The difference of non-image data such as EXIF DateTimeOriginal are
+ignored.
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -76,6 +77,23 @@ optional arguments:
                         preload the previous "oaieu id" STDOUT result saved as
                         PRELOAD
   -u, --uniq            remove excess duplicates -n NUMBER, --number NUMBER
+                        number of duplicates allowed: 1 (default)
+```
+## oaieu uniq
+```
+usage: oaieu uniq [-h] [-u] [-n NUMBER]
+
+read the result of "id" sub-command run without "-u" to extract duplicated
+image identifier list with different EXIF timestamp from the first checked one
+in TSV to STDOUT and optionally remove excess duplicates. Instead of using
+"id" sub-command with "-u", this sub-command should help you manually select
+desired set of files. The STDIN and STDOUT of this "uniq" sub-command are the
+same as STDOUT of "id" sub-command.
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -u, --uniq            remove excess duplicates (check ID only)
+  -n NUMBER, --number NUMBER
                         number of duplicates allowed: 1 (default)
 ```
 ## oaieu rm
