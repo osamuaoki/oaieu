@@ -128,7 +128,7 @@ def find(args):
         dirnames[:] = [d for d in dirnames if not os.path.ismount(d)]
         for filename in filenames:
             filepath = os.path.join(dirpath, filename)
-            filetype = "others" # default
+            filetype = "others"  # default
             msg(3, "D: file = {}".format(filepath))
             if filepath.lower().endswith(jpeg_ext):
                 if os.path.islink(filepath):
@@ -143,14 +143,30 @@ def find(args):
                     except:
                         msg(1, "W: broken EXIF: {}".format(filepath))
                     else:
-                        if ("Exif.Image.DateTimeOriginal" in exifdata
-                        and "Exif.Image.DateTimeDigitized" in exifdata
-                        and "Exif.Image.DateTime" in exifdata):
-                            if exifdata["Exif.Image.DateTimeOriginal"] == exifdata["Exif.Image.DateTimeDigitized"] == exifdata["Exif.Image.DateTime"]:
-                                msg(2, "I: EXIF with matched DateTime*: {}".format(filepath))
+                        if (
+                            "Exif.Image.DateTimeOriginal" in exifdata
+                            and "Exif.Image.DateTimeDigitized" in exifdata
+                            and "Exif.Image.DateTime" in exifdata
+                        ):
+                            if (
+                                exifdata["Exif.Image.DateTimeOriginal"]
+                                == exifdata["Exif.Image.DateTimeDigitized"]
+                                == exifdata["Exif.Image.DateTime"]
+                            ):
+                                msg(
+                                    2,
+                                    "I: EXIF with matched DateTime*: {}".format(
+                                        filepath
+                                    ),
+                                )
                                 filetype = "jpeg-matched-datetime"
                             else:
-                                msg(2, "I: EXIF with skewed DateTime*: {}".format(filepath))
+                                msg(
+                                    2,
+                                    "I: EXIF with skewed DateTime*: {}".format(
+                                        filepath
+                                    ),
+                                )
                                 filetype = "jpeg-skewed-datetime"
                         else:
                             msg(2, "I: EXIF without DateTime: {}".format(filepath))
@@ -160,7 +176,7 @@ def find(args):
             else:
                 msg(2, "I: no JPEG extension:  {}".format(filepath))
             # allow short spec
-            if args.filetype == filetype[:len(args.filetype)]:
+            if args.filetype == filetype[: len(args.filetype)]:
                 msg(3, "D: filetype={}\t{}".format(filetype, filepath))
                 print(filepath)
     return
@@ -202,11 +218,55 @@ def id(args):
         if hvc > args.number and args.uniq:
             removefile(path)
             hvcount[hv] += -1
-            msg(3, "D: count={:02} delete: {}".format(hvc, filepath))
+            msg(1, "W: count={:02} delete: {} {}".format(hvc, dtstr, filepath))
             action = "***delete***"
+        elif hvc > args.number:
+            msg(2, "I: count={:02} duplicates: {} {}".format(hvc, dtstr, filepath))
+            action = ""
         else:
             action = ""
         print("{}\t{:02}\t{}\t{}\t{}".format(hv, hvc, dtstr, filepath, action))
+    return
+
+
+def uniq(args):
+    hvdict = dict()
+    for line in sys.stdin.read().splitlines():
+        (hv, hvc, dtstr, filepath, action) = line.split("\t")
+        # ignore "***delete***" line
+        if action != "":
+            if hv in hvdict:
+                hvdict[hv].append(dtstr, filepath)
+            else:
+                hvdict[hv] = [(dtstr, filepath)]
+    action = ""
+    for hv in hvdict:
+        (dtstr0, filepath0) = hvdict[hv][0]
+        samedtstr = True
+        for (dtstr, filepath) in hvdict[hv]:
+            if dtstr != dtstr0:
+                samedtstr = False
+                break
+        if not samedtstr:
+            hvc = 0
+            for (dtstr, filepath) in hvdict[hv]:
+                hvc += 1
+                if hvc > args.number and args.uniq:
+                    removefile(path)
+                    hvc += -1
+                    msg(1, "W: count={:02} delete: {} {}".format(hvc, dtstr, filepath))
+                    action = "***delete***"
+                elif hvc > args.number:
+                    msg(
+                        2,
+                        "I: count={:02} duplicates: {} {}".format(hvc, dtstr, filepath),
+                    )
+                    action = ""
+                else:
+                    action = ""
+                if hvc > 99:
+                    hvc = 99
+                print("{}\t{:02}\t{}\t{}\t{}".format(hv, hvc, dtstr, filepath, action))
     return
 
 
@@ -574,10 +634,15 @@ generate the image identity hash string.
 The common options across subcommands are specified right after the parent
 command.  STDIN and STDOUT are meant to be re-directed to files.  The messaging
 to the user uses only STDERR.
+
+These python scripts address only image identity and can match the same image
+data with different EXIF DateTimeOriginal values.  For generic simple file
+identity tracking tasks, please seek help in established tools such as:
+"fdupes", "jdupes", "fslint", and "rmlint/rmlint-gui".
 """.format(
-            version = "0.1", progname = os.path.basename(sys.argv[0])
+            version="0.1", progname=os.path.basename(sys.argv[0])
         ),
-        epilog="""
+        epilog="""\
 See https://github.com/osamuaoki/{}
 Copyright (C) 2020 Osamu Aoki <osamu@debian.org>
 License: GPL 2.0+
@@ -600,11 +665,8 @@ License: GPL 2.0+
     # sub-command
     #######################################################################
     subparsers = parser.add_subparsers(
-            title="subcommands", help="action (use '-h' for more help)"
+        title="subcommands", help="action (use '-h' for more help)"
     )
-#        description="""\
-#help for sub-commands are available by following each one of them with
-#--help."""
     #######################################################################
     # sub-command: find
     #######################################################################
@@ -631,7 +693,7 @@ FILETYPE to match: "jpeg" (default), "jpeg-matched-datetime",
 "jpeg-skewed-datetime", "jpegmissing-datetime", or "others".  "jpeg-" can be
 used to match all 2 "jpeg-*" with all 3 "datetime" data which may produce
 better list. Files listed by "jpegmissing-datetime" (or "jpegm") require manual
-attention in the dollowinh processing.  Specification can be shortened.
+attention in the following processing.  Specification can be shortened.
 """,
     )
     parser_find.add_argument(
@@ -648,13 +710,14 @@ file extensions to match for JPEG files (comma separated, case insensitive):
     #######################################################################
     parser_id = subparsers.add_parser(
         "id",
-        help="generate image identifier list and optionally remove diplicates",
+        help="generate image identifier list and optionally remove duplicates",
         description="""\
 read the JPEG file path list from the STDIN, calculate the image identifier
 (ID, hash value for the JPEG image data), count up for each ID, print result
 list in TSV to STDOUT, and optionally remove excess duplicates.  STDOUT result
 can be saved as PRELOAD and used to preload the counter in the following
-processing.""",
+processing.  The difference of non-image data such as EXIF DateTimeOriginal are
+ignored.""",
     )
     parser_id.add_argument(
         "-p",
@@ -669,7 +732,7 @@ preload the previous "oaieu id" STDOUT result saved as PRELOAD""",
         "--uniq",
         default=False,
         action="store_true",
-        help="remove excess duplicates",
+        help="remove excess duplicates (check ID only)",
     )
     parser_id.add_argument(
         "-n",
@@ -680,6 +743,36 @@ preload the previous "oaieu id" STDOUT result saved as PRELOAD""",
 number of duplicates allowed: 1 (default)""",
     )
     parser_id.set_defaults(func=id)
+    #######################################################################
+    # sub-command: uniq
+    #######################################################################
+    parser_uniq = subparsers.add_parser(
+        "uniq",
+        help="extract duplicated image identifier list",
+        description="""\
+read the result of "id" sub-command run without "-u" to extract duplicated
+image identifier list with different EXIF timestamp from the first checked one
+in TSV to STDOUT and optionally remove excess duplicates.  Instead of using
+"id" sub-command with "-u", this sub-command should help you manually select
+desired set of files.  The STDIN and STDOUT of this "uniq" sub-command are the
+same as STDOUT of "id" sub-command.""",
+    )
+    parser_uniq.add_argument(
+        "-u",
+        "--uniq",
+        default=False,
+        action="store_true",
+        help="remove excess duplicates (check ID only)",
+    )
+    parser_uniq.add_argument(
+        "-n",
+        "--number",
+        default=1,
+        type=int,
+        help="""\
+number of duplicates allowed: 1 (default)""",
+    )
+    parser_uniq.set_defaults(func=uniq)
     #######################################################################
     # sub-command: rm
     #######################################################################
