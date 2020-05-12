@@ -123,9 +123,10 @@ def find(args):
         msg(1, "W: filetype = {} --> jpeg".format(args.filetype))
         args.filetype = "jpeg"
     msg(3, "D: base_path = {}".format(base_path))
-    for dirpath, dirnames, filenames in os.walk(base_path):
+    for dirpath, dirnames, filenames in sorted(os.walk(base_path)):
         # don't walk out of filesystem
         dirnames[:] = [d for d in dirnames if not os.path.ismount(d)]
+        filenames.sort()
         for filename in filenames:
             filepath = os.path.join(dirpath, filename)
             filetype = "others"  # default
@@ -694,6 +695,7 @@ FILETYPE to match: "jpeg" (default), "jpeg-matched-datetime",
 used to match all 2 "jpeg-*" with all 3 "datetime" data which may produce
 better list. Files listed by "jpegmissing-datetime" (or "jpegm") require manual
 attention in the following processing.  Specification can be shortened.
+The result is sorted in ASCII order.
 """,
     )
     parser_find.add_argument(
